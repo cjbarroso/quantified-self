@@ -1,0 +1,135 @@
+#+title: Readme
+
+Automatizacion para mi reloj MI6 band de Xiaomi
+
+* Makefile
+#+begin_src makefile :tangle Makefile
+## ----------------------------------------------------------------------
+## Get data, clean everything, build the parquet storage for my watch data
+## ----------------------------------------------------------------------
+
+help:     ## Show this help.
+	@sed -ne '/@sed/!s/^## //p' $(MAKEFILE_LIST) # Shows the introductory text
+# Next line shows the targets nicely formatted
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+
+clean: ## Delete everything that can be regenerated
+	rm -Rf input/*
+	rm -Rf reloj-data/*
+	@echo "CLEANED"
+
+sourcedata: ## Get the .csv from origin write them in input/ after conversion
+	@bash get-data.sh
+	@echo "Data importation finished"
+
+convert: sourcedata ## Convert input data to parquet format with partitions
+	@python convert.py
+	@echo "Conversion finished"
+
+sync: ## Sincronizar con el bucket s3
+	aws s3 sync --profile cjaquita reloj-data/ s3://cjbarroso-reloj-data
+
+.DEFAULT_GOAL := help
+
+
+#+end_src
+* Obtención de los archivos
+Los archivos vienen un un .csv. Por ahora descargo todo desde el 1 de enero de 2022 hasta la fecha y voy "pisando" todo, verremos si en el futuro lo mejoro.
+Entiendo que si uso parquet sobre los mismos directorios y voy pisando los archivos no hay problema, se va deduplicando todo solo (creo)
+
+Se descomprimen en una carpeta, de ahi sacamos:
+
+| carpeta origen  | archivo destino     | que es                                                       |
+|-----------------+---------------------+--------------------------------------------------------------|
+| ACTIVITY        | activity.csv        | Un resumen diario de actividad (pasos y calorias)            |
+| ACTIVITY_MINUTE | activity-minute.csv | actividad por minuto                                         |
+| ACTIVITY_STAGE  | activity-stage.csv  | Como el anterior pero agrupado por bloques                   |
+| HEARTRATE       | heartrate.csv       | Las veces que me tome el ritmo cardiaco manualmente          |
+| HEARTRATE_AUTO  | heartrate-auto.csv  | latidos tomados periodicamente (cada 1 minuto)               |
+| SLEEP           | sleep.csv           | Resumen de sueño por noche                                   |
+| SPORT           | sport.csv           | Una linea por cada vez que puse el reloj a trakear actividad |
+
+El .zip tiene una lista de carpetas, cada una con un solo archivo .csv adentro con un nombre que cambia con el timestamp. No hay problema y no lo necesito, por lo que mi script va a tomar el primer .csv que encuentre en cada directorio, le va a hacer las transformaciones que requiera y lo va a mover a su destino final (channnn).
+
+
+#+begin_src shell :tangle get-data.sh :shebang #!/usr/bin/env bash
+# Source folder: where the .zip has been unpacked. Has one subfolder for each type of data that the watch returns.
+SRCFOLDER=~/Documentos/reloj
+# Destination folder: Where the .csv files are moved after preprocessing
+DSTFOLDER=~/Projects/personal/reloj/input
+
+# Hearthrate auto: This file needs no preprocessing
+cp ${SRCFOLDER}/HEARTRATE_AUTO/$(ls -1 ${SRCFOLDER}/HEARTRATE_AUTO | head -n1) ${DSTFOLDER}/hearthrate-auto.csv
+
+# Sleep file. I need to remove the last column
+csvtool -c1-7 ${SRCFOLDER}/SLEEP/$(ls -1 ${SRCFOLDER}/SLEEP | head -n1)> ${DSTFOLDER}/sleep.csv
+echo "Finished getting data"
+#+end_src
+
+#+RESULTS:
+
+
+* Conversion de .csv a parquet
+:PROPERTIES:
+:header-args: :dir ~/Projects/personal/reloj
+:END:
+Necesito? convertir los reportes del reloj de .csv a formato parquet.
+Tambien necesito una forma de deduplicar los datos, pero no por ahora.
+** Creación de un virtualenv
+
+#+begin_src shell
+pyenv virtualenv 3.9.1 reloj
+#+end_src
+
+
+** Creación del proyecto python
+
+*** Requirements file
+Armo un requirements file
+
+#+begin_src txt :tangle requirements.txt
+pyarrow
+pandas
+#+end_src
+
+
+
+
+*** script de conversion
+
+Esto espera los .csv nombrados correctamente en la subcarpeta =input/=
+
+#+begin_src python :tangle convert.py
+import pandas as pd
+
+# Hearthrate
+df = pd.read_csv('input/hearthrate-auto.csv')
+df.date = pd.to_datetime(df.date)
+df.date = pd.to_datetime(df.date)
+df['year'] = df['date'].dt.year
+df['month'] = df['date'].dt.month
+df.to_parquet('reloj-data/hearthrate-auto', partition_cols=['year', 'month'])
+
+# Sleep
+df = pd.read_csv('input/sleep.csv')
+df.date = pd.to_datetime(df.date)
+df.date = pd.to_datetime(df.date)
+df['year'] = df['date'].dt.year
+df['month'] = df['date'].dt.month
+df.to_parquet('reloj-data/sleep', partition_cols=['year', 'month'])
+
+#+end_src
+
+Alternativa, sin usar pandas. Es mas chico pero si tengo que hacer CUALQUIER modificacion a los datos ya necesito pandas. (por ejemplo, particionado)
+#+begin_src python
+import pyarrow.csv as pv
+import pyarrow.parquet as pq
+
+table = pv.read_csv(filename)
+pq.write_table(table, filename.replace('csv', 'parquet'))
+#+end_src
+
+
+
+* Syncronizacion con un bucket
+Una vez que tenga los datos en formato parquet y particionado necesito sincronizar el directorio con un bucket S3 para poder usar Athena para hacer queries just for fun.
